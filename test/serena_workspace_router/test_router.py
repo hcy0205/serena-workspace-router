@@ -95,6 +95,44 @@ def test_missing_project_path_does_not_fall_back_to_cwd(tmp_path: Path) -> None:
         anyio.run(router.close)
 
 
+def test_explicit_project_path_allows_missing_workspace_id_on_first_request(tmp_path: Path) -> None:
+    router_paths = {
+        "runtime": tmp_path / "runtime",
+        "coordination": tmp_path / "coordination",
+        "bootstrap": tmp_path / "bootstrap",
+        "repo_root": Path(__file__).resolve().parents[2],
+        "mock_child": Path(__file__).resolve().parent / "mock_child_server.py",
+    }
+    project_root = _create_project(tmp_path, "project-explicit-path")
+    router = _build_router(router_paths)
+    try:
+        resolved = router._resolve_request_context({"project_path": str(project_root)}, {}, "session-a")
+        assert resolved.workspace_id == "session-session-a"
+        assert resolved.client_id == "codex"
+        assert resolved.project_path == str(project_root.resolve())
+    finally:
+        anyio.run(router.close)
+
+
+def test_explicit_project_argument_allows_missing_workspace_id_on_first_request(tmp_path: Path) -> None:
+    router_paths = {
+        "runtime": tmp_path / "runtime",
+        "coordination": tmp_path / "coordination",
+        "bootstrap": tmp_path / "bootstrap",
+        "repo_root": Path(__file__).resolve().parents[2],
+        "mock_child": Path(__file__).resolve().parent / "mock_child_server.py",
+    }
+    project_root = _create_project(tmp_path, "project-explicit-activate")
+    router = _build_router(router_paths)
+    try:
+        resolved = router._resolve_request_context({"project": str(project_root)}, {}, "session-a")
+        assert resolved.workspace_id == "session-session-a"
+        assert resolved.client_id == "codex"
+        assert resolved.project_path == str(project_root.resolve())
+    finally:
+        anyio.run(router.close)
+
+
 def test_private_memories_are_isolated_by_workspace_project_and_client(tmp_path: Path) -> None:
     router_paths = {
         "runtime": tmp_path / "runtime",
@@ -109,10 +147,18 @@ def test_private_memories_are_isolated_by_workspace_project_and_client(tmp_path:
 
     async def _run() -> None:
         try:
-            await _write_private_memory(router, context=_resolved_context(project_a, "ws-a", "codex"), memory_name="private/demo", content="workspace-a")
-            await _write_private_memory(router, context=_resolved_context(project_a, "ws-b", "codex"), memory_name="private/demo", content="workspace-b")
-            await _write_private_memory(router, context=_resolved_context(project_b, "ws-a", "codex"), memory_name="private/demo", content="project-b")
-            await _write_private_memory(router, context=_resolved_context(project_a, "ws-a", "agent-b"), memory_name="private/demo", content="client-b")
+            await _write_private_memory(
+                router, context=_resolved_context(project_a, "ws-a", "codex"), memory_name="private/demo", content="workspace-a"
+            )
+            await _write_private_memory(
+                router, context=_resolved_context(project_a, "ws-b", "codex"), memory_name="private/demo", content="workspace-b"
+            )
+            await _write_private_memory(
+                router, context=_resolved_context(project_b, "ws-a", "codex"), memory_name="private/demo", content="project-b"
+            )
+            await _write_private_memory(
+                router, context=_resolved_context(project_a, "ws-a", "agent-b"), memory_name="private/demo", content="client-b"
+            )
         finally:
             await router.close()
 
@@ -144,9 +190,13 @@ def test_activate_project_allows_omitting_project_path_in_same_session(tmp_path:
 
     anyio.run(_run)
     router._remember_context(context)
-    resolved = router._resolve_request_context({"memory_name": "private/after_activate"}, {"workspaceId": "ws-a", "clientId": "codex"}, "session-a")
+    resolved = router._resolve_request_context(
+        {"memory_name": "private/after_activate"}, {"workspaceId": "ws-a", "clientId": "codex"}, "session-a"
+    )
     assert resolved.project_path == context.project_path
-    assert _memory_file(router_paths["runtime"], project_root, "ws-a", "codex", "private/after_activate").read_text(encoding="utf-8") == "ok"
+    assert (
+        _memory_file(router_paths["runtime"], project_root, "ws-a", "codex", "private/after_activate").read_text(encoding="utf-8") == "ok"
+    )
 
 
 def test_shared_feed_and_claims_are_project_scoped(tmp_path: Path) -> None:

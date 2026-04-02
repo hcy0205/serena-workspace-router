@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, TextIO
 
 import mcp.types as types
 from mcp.client.session import ClientSession
@@ -18,6 +18,7 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool, ToolAnnotations
 
 from serena_workspace_router.config import (
+    CodexSerenaBindingState,
     ProjectSerenaConfigState,
     describe_project_root_serena_config_requirement,
     get_project_root_serena_config_path,
@@ -68,9 +69,9 @@ class RouterConfig:
     @classmethod
     def from_environment(cls, *, child_args: list[str]) -> "RouterConfig":
         runtime_base_dir = Path(os.environ.get("WORKSPACE_SERENA_RUNTIME_DIR", ".workspace-serena-runtime")).expanduser().resolve()
-        coordination_base_dir = Path(
-            os.environ.get("PROJECT_SHARED_COORDINATION_DIR", runtime_base_dir.parent / "project-shared-space")
-        ).expanduser().resolve()
+        coordination_base_dir = (
+            Path(os.environ.get("PROJECT_SHARED_COORDINATION_DIR", runtime_base_dir.parent / "project-shared-space")).expanduser().resolve()
+        )
         shared_language_servers_dir = os.environ.get("WORKSPACE_SERENA_SHARED_LANGUAGE_SERVERS_DIR")
         bootstrap_project_path = os.environ.get("LAUNCHER_BOOTSTRAP_PROJECT_PATH")
         return cls(
@@ -83,9 +84,7 @@ class RouterConfig:
             default_client_id=os.environ.get("LAUNCHER_DEFAULT_CLIENT_ID", "codex"),
             default_workspace_id=os.environ.get("LAUNCHER_DEFAULT_WORKSPACE_ID") or None,
             allow_session_fallback=os.environ.get("LAUNCHER_ALLOW_SESSION_FALLBACK", "").lower() in {"1", "true", "yes", "on"},
-            bootstrap_project_path=Path(bootstrap_project_path).expanduser().resolve()
-            if bootstrap_project_path
-            else runtime_base_dir,
+            bootstrap_project_path=Path(bootstrap_project_path).expanduser().resolve() if bootstrap_project_path else runtime_base_dir,
             stdio_session_id=os.environ.get("LAUNCHER_STDIO_SESSION_ID"),
         )
 
@@ -248,7 +247,7 @@ class SerenaChildInstance:
     def __init__(self, plan: InstancePlan) -> None:
         self.plan = plan
         self._session: ClientSession | None = None
-        self._stderr_handle = None
+        self._stderr_handle: TextIO | None = None
         self._start_lock = asyncio.Lock()
         self._activation_lock = asyncio.Lock()
         self._request_queue: asyncio.Queue[ChildWorkerRequest] | None = None
@@ -276,7 +275,9 @@ class SerenaChildInstance:
         result = await self._dispatch_request("list_tools")
         return result
 
-    async def call_tool(self, name: str, arguments: dict[str, Any] | None = None, meta: dict[str, Any] | None = None) -> types.CallToolResult:
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any] | None = None, meta: dict[str, Any] | None = None
+    ) -> types.CallToolResult:
         result = await self._dispatch_request(
             "call_tool",
             name=name,
@@ -628,23 +629,25 @@ class WorkspaceSerenaRouterServer:
         self._active_context_key_by_session[context.session_id] = context.workspace_id
 
     def _resolve_request_context(self, arguments: dict[str, Any], meta: dict[str, Any], session_id: str) -> ResolvedRequestContext:
+        incoming_project_path = (
+            _string_or_none(arguments.get("project"))
+            or _string_or_none(arguments.get("project_path"))
+            or _string_or_none(meta.get("projectPath"))
+        )
         workspace_hint = _string_or_none(meta.get("workspaceId"))
         stored = self._get_stored_context(session_id, workspace_hint)
         workspace_id = workspace_hint or (stored.workspace_id if stored else None) or self.config.default_workspace_id
-        if not workspace_id and self.config.allow_session_fallback:
+        # 新会话首包若显式提供了项目路径, 允许生成会话级 workspace id,
+        # 这样 inspect_* / activate_project 不会因为缺少 workspaceId 被过早拦截。
+        if not workspace_id and (incoming_project_path or self.config.allow_session_fallback):
             workspace_id = f"session-{sanitize_segment(session_id)}"
         if not workspace_id:
             raise ValueError("当前请求缺少 `_meta.workspaceId`，且当前会话没有已激活的工作区上下文。")
 
-        client_id = (
-            _string_or_none(meta.get("clientId"))
-            or (stored.client_id if stored else None)
-            or self.config.default_client_id
-        )
+        client_id = _string_or_none(meta.get("clientId")) or (stored.client_id if stored else None) or self.config.default_client_id
         if not client_id:
             raise ValueError("当前请求缺少 `_meta.clientId`。")
 
-        incoming_project_path = _string_or_none(arguments.get("project")) or _string_or_none(arguments.get("project_path")) or _string_or_none(meta.get("projectPath"))
         project_path = incoming_project_path or (stored.project_path if stored else None)
         if not project_path:
             raise ValueError("当前请求缺少 `_meta.projectPath`，且当前会话没有已激活的项目上下文。")
@@ -658,6 +661,7 @@ class WorkspaceSerenaRouterServer:
 
     def _handle_launcher_tool(self, tool_name: str, arguments: dict[str, Any], context: ResolvedRequestContext) -> types.CallToolResult:
         project_path = _string_or_none(arguments.get("project_path")) or context.project_path
+        state: ProjectSerenaConfigState | CodexSerenaBindingState
         if not project_path:
             raise ValueError("缺少 project_path，无法检查或创建 Serena 配置。")
         if tool_name == "inspect_project_serena":
@@ -674,7 +678,9 @@ class WorkspaceSerenaRouterServer:
             return _json_result({"ok": True, "projectPath": project_path, **state.to_payload()})
         raise ValueError(f"未知路由工具：{tool_name}")
 
-    async def _handle_coordinator_tool(self, tool_name: str, arguments: dict[str, Any], context: ResolvedRequestContext) -> types.CallToolResult:
+    async def _handle_coordinator_tool(
+        self, tool_name: str, arguments: dict[str, Any], context: ResolvedRequestContext
+    ) -> types.CallToolResult:
         if tool_name == "claim_scope":
             payload = self.coordinator.claim_scope(
                 project_path=context.project_path,
@@ -800,8 +806,12 @@ def _string_or_none(value: object) -> str | None:
 def _int_or_none(value: object) -> int | None:
     if value is None:
         return None
-    try:
+    if isinstance(value, bool):
         return int(value)
+    if isinstance(value, int):
+        return value
+    try:
+        return int(str(value).strip())
     except (TypeError, ValueError):
         return None
 

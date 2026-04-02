@@ -173,9 +173,9 @@ def test_shared_feed_and_claims_are_project_scoped(tmp_path: Path) -> None:
         await router._sync_project_root_config_into_instance(context_b, instance_b.plan.project_serena_folder)
         return instance_a.plan.project_serena_folder, instance_a_other.plan.project_serena_folder, instance_b.plan.project_serena_folder
 
-    same_project_dir: Path
-    other_workspace_dir: Path
-    other_project_dir: Path
+    same_project_dir = tmp_path / "__same_project_dir__"
+    other_workspace_dir = tmp_path / "__other_workspace_dir__"
+    other_project_dir = tmp_path / "__other_project_dir__"
 
     async def _run() -> None:
         nonlocal same_project_dir, other_workspace_dir, other_project_dir
@@ -232,3 +232,40 @@ def test_shared_feed_and_claims_are_project_scoped(tmp_path: Path) -> None:
     assert claim_a["status"] == "granted"
     assert claim_same_project["status"] == "hard_conflict"
     assert claim_other_project["status"] == "granted"
+
+
+def test_router_launcher_tools_cover_codex_binding_inspect_and_setup(tmp_path: Path, monkeypatch) -> None:
+    router_paths = {
+        "runtime": tmp_path / "runtime",
+        "coordination": tmp_path / "coordination",
+        "bootstrap": tmp_path / "bootstrap",
+        "repo_root": Path(__file__).resolve().parents[2],
+        "mock_child": Path(__file__).resolve().parent / "mock_child_server.py",
+    }
+    monkeypatch.setenv("APPDATA", str(tmp_path / "AppData" / "Roaming"))
+    project_root = tmp_path / "router-binding-project"
+    project_root.mkdir()
+    router = _build_router(router_paths)
+    context = _resolved_context(project_root, "ws-a", "codex")
+
+    try:
+        inspect_result = router._handle_launcher_tool(
+            "inspect_codex_serena_binding",
+            {"project_path": str(project_root), "include_global": False},
+            context,
+        )
+        inspect_payload = inspect_result.structuredContent
+        assert inspect_payload is not None
+        assert inspect_payload["status"] == "missing"
+
+        setup_result = router._handle_launcher_tool(
+            "setup_codex_serena_binding",
+            {"project_path": str(project_root), "update_global": False},
+            context,
+        )
+        setup_payload = setup_result.structuredContent
+        assert setup_payload is not None
+        assert setup_payload["status"] == "created"
+        assert setup_payload["project_binding_ok"] is True
+    finally:
+        anyio.run(router.close)

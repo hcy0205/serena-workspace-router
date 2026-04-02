@@ -1,14 +1,14 @@
+# ruff: noqa: RUF001
 import asyncio
 import json
 import os
 import shutil
 import sys
 from contextlib import AsyncExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import anyio
 import mcp.types as types
 from mcp.client.session import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -21,9 +21,11 @@ from serena_workspace_router.config import (
     describe_project_root_serena_config_requirement,
     get_project_root_serena_config_path,
     get_project_root_serena_local_config_path,
+    inspect_codex_serena_binding,
     inspect_project_root_serena_config,
     normalize_project_root,
     sanitize_segment,
+    setup_codex_serena_binding,
     setup_project_root_serena_config,
     sha1_text,
 )
@@ -38,7 +40,12 @@ COORDINATOR_TOOL_NAMES = {
     "read_project_feed",
     "read_active_claims",
 }
-LAUNCHER_TOOL_NAMES = {"inspect_project_serena", "setup_project_serena"}
+LAUNCHER_TOOL_NAMES = {
+    "inspect_project_serena",
+    "setup_project_serena",
+    "inspect_codex_serena_binding",
+    "setup_codex_serena_binding",
+}
 BOOTSTRAP_TOOL_NAMES = {"initial_instructions", "get_current_config", "open_dashboard", "switch_modes"}
 SHARED_MEMORY_MUTATION_TOOL_NAMES = {"write_memory", "edit_memory", "delete_memory", "rename_memory"}
 
@@ -133,14 +140,16 @@ def _json_result(payload: dict[str, Any]) -> types.CallToolResult:
 
 
 def _build_tool(name: str, description: str, input_schema: dict[str, Any]) -> Tool:
+    write_tools = {"claim_scope", "release_scope", "publish_change", "setup_project_serena", "setup_codex_serena_binding"}
+    destructive_tools = {"release_scope", "setup_project_serena", "setup_codex_serena_binding"}
     return Tool(
         name=name,
         description=description,
         inputSchema=input_schema,
         annotations=ToolAnnotations(
             title=" ".join(word.capitalize() for word in name.split("_")),
-            readOnlyHint=name not in {"claim_scope", "release_scope", "publish_change", "setup_project_serena"},
-            destructiveHint=name in {"release_scope", "setup_project_serena"},
+            readOnlyHint=name not in write_tools,
+            destructiveHint=name in destructive_tools,
         ),
     )
 
@@ -148,7 +157,7 @@ def _build_tool(name: str, description: str, input_schema: dict[str, Any]) -> To
 LAUNCHER_TOOLS = [
     _build_tool(
         "inspect_project_serena",
-        "检查当前或指定项目的 Serena 接入状态，不会创建或修改任何项目文件。",
+        "检查当前或指定项目的 Serena 项目配置状态，不会创建或修改任何项目文件。",
         _tool_input_schema({"project_path": {"type": "string"}}),
     ),
     _build_tool(
@@ -156,7 +165,28 @@ LAUNCHER_TOOLS = [
         "在用户明确同意后，为当前或指定项目创建或修复 `.serena/project.yml`。",
         _tool_input_schema({"project_path": {"type": "string"}}),
     ),
+    _build_tool(
+        "inspect_codex_serena_binding",
+        "检查当前或指定项目的 Codex Serena 绑定是否已按 GitHub zip 形式配置。",
+        _tool_input_schema(
+            {
+                "project_path": {"type": "string"},
+                "include_global": {"type": "boolean"},
+            }
+        ),
+    ),
+    _build_tool(
+        "setup_codex_serena_binding",
+        "在用户明确同意后，为当前或指定项目创建或修复 `.codex/config.toml` 中的 Serena GitHub zip 绑定。",
+        _tool_input_schema(
+            {
+                "project_path": {"type": "string"},
+                "update_global": {"type": "boolean"},
+            }
+        ),
+    ),
 ]
+
 COORDINATOR_TOOLS = [
     _build_tool(
         "claim_scope",
@@ -529,6 +559,12 @@ class WorkspaceSerenaRouterServer:
         if tool_name == "setup_project_serena":
             state = setup_project_root_serena_config(project_path)
             return _json_result({"ok": True, "projectPath": project_path, **state.to_payload()})
+        if tool_name == "inspect_codex_serena_binding":
+            state = inspect_codex_serena_binding(project_path, include_global=_bool_or_default(arguments.get("include_global"), True))
+            return _json_result({"ok": True, "projectPath": project_path, **state.to_payload()})
+        if tool_name == "setup_codex_serena_binding":
+            state = setup_codex_serena_binding(project_path, update_global=_bool_or_default(arguments.get("update_global"), False))
+            return _json_result({"ok": True, "projectPath": project_path, **state.to_payload()})
         raise ValueError(f"未知路由工具：{tool_name}")
 
     async def _handle_coordinator_tool(self, tool_name: str, arguments: dict[str, Any], context: ResolvedRequestContext) -> types.CallToolResult:
@@ -661,6 +697,19 @@ def _int_or_none(value: object) -> int | None:
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _bool_or_default(value: object, default: bool) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    return default
 
 
 def _list_of_strings(value: object) -> list[str]:

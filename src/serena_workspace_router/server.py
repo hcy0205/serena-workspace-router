@@ -123,6 +123,15 @@ class InstancePlan:
     child_cwd: Path | None
 
 
+@dataclass(slots=True)
+class ChildWorkerRequest:
+    operation: str
+    response: asyncio.Future[Any]
+    name: str | None = None
+    arguments: dict[str, Any] | None = None
+    meta: dict[str, Any] | None = None
+
+
 def _tool_input_schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
     return {
         "type": "object",
@@ -238,48 +247,43 @@ COORDINATOR_TOOLS = [
 class SerenaChildInstance:
     def __init__(self, plan: InstancePlan) -> None:
         self.plan = plan
-        self._stack: AsyncExitStack | None = None
         self._session: ClientSession | None = None
         self._stderr_handle = None
         self._start_lock = asyncio.Lock()
         self._activation_lock = asyncio.Lock()
+        self._request_queue: asyncio.Queue[ChildWorkerRequest] | None = None
+        self._ready_future: asyncio.Future[None] | None = None
+        self._worker_task: asyncio.Task[None] | None = None
         self.active_project_path: str | None = None
 
     async def start(self) -> "SerenaChildInstance":
-        if self._session is not None:
-            return self
         async with self._start_lock:
-            if self._session is not None:
+            if self._worker_task is not None and not self._worker_task.done():
+                ready_future = self._ready_future
+                if ready_future is not None:
+                    await ready_future
                 return self
-            self.plan.log_path.parent.mkdir(parents=True, exist_ok=True)
-            self._stderr_handle = self.plan.log_path.open("a", encoding="utf-8")
-            stack = AsyncExitStack()
-            read_stream, write_stream = await stack.enter_async_context(
-                stdio_client(
-                    StdioServerParameters(
-                        command=self.plan.child_command,
-                        args=self.plan.child_args,
-                        env=self.plan.child_env,
-                        cwd=self.plan.child_cwd,
-                    ),
-                    errlog=self._stderr_handle,
-                )
+            self._request_queue = asyncio.Queue()
+            self._ready_future = asyncio.get_running_loop().create_future()
+            self._worker_task = asyncio.create_task(
+                self._run_worker(),
+                name=f"serena-child-{self.plan.cache_key}",
             )
-            session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
-            await session.initialize()
-            self._stack = stack
-            self._session = session
+            await self._ready_future
         return self
 
     async def list_tools(self) -> list[Tool]:
-        await self.start()
-        assert self._session is not None
-        return (await self._session.list_tools()).tools
+        result = await self._dispatch_request("list_tools")
+        return result
 
     async def call_tool(self, name: str, arguments: dict[str, Any] | None = None, meta: dict[str, Any] | None = None) -> types.CallToolResult:
-        await self.start()
-        assert self._session is not None
-        return await self._session.call_tool(name, arguments or {}, meta=meta)
+        result = await self._dispatch_request(
+            "call_tool",
+            name=name,
+            arguments=arguments or {},
+            meta=meta,
+        )
+        return result
 
     async def ensure_activated(self, project_path: str, meta: dict[str, Any] | None = None) -> None:
         if self.active_project_path == project_path:
@@ -293,17 +297,119 @@ class SerenaChildInstance:
             self.active_project_path = project_path
 
     async def close(self) -> None:
-        if self._stack is not None:
+        worker_task = self._worker_task
+        request_queue = self._request_queue
+        if worker_task is not None and not worker_task.done() and request_queue is not None:
             try:
-                await self._stack.aclose()
+                response = asyncio.get_running_loop().create_future()
+                await request_queue.put(ChildWorkerRequest(operation="close", response=response))
+                await response
             except BaseException:
                 pass
-            finally:
-                self._stack = None
-                self._session = None
-        if self._stderr_handle is not None:
-            self._stderr_handle.close()
-            self._stderr_handle = None
+        if worker_task is not None:
+            try:
+                await worker_task
+            except BaseException:
+                pass
+
+    async def _dispatch_request(
+        self,
+        operation: str,
+        *,
+        name: str | None = None,
+        arguments: dict[str, Any] | None = None,
+        meta: dict[str, Any] | None = None,
+    ) -> Any:
+        await self.start()
+        request_queue = self._request_queue
+        if request_queue is None:
+            raise RuntimeError("Serena 子进程未成功启动。")
+        response = asyncio.get_running_loop().create_future()
+        await request_queue.put(
+            ChildWorkerRequest(
+                operation=operation,
+                response=response,
+                name=name,
+                arguments=arguments,
+                meta=meta,
+            )
+        )
+        return await response
+
+    async def _run_worker(self) -> None:
+        request_queue = self._request_queue
+        ready_future = self._ready_future
+        try:
+            assert request_queue is not None
+            self.plan.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._stderr_handle = self.plan.log_path.open("a", encoding="utf-8")
+            async with AsyncExitStack() as stack:
+                read_stream, write_stream = await stack.enter_async_context(
+                    stdio_client(
+                        StdioServerParameters(
+                            command=self.plan.child_command,
+                            args=self.plan.child_args,
+                            env=self.plan.child_env,
+                            cwd=self.plan.child_cwd,
+                        ),
+                        errlog=self._stderr_handle,
+                    )
+                )
+                session = await stack.enter_async_context(ClientSession(read_stream, write_stream))
+                await session.initialize()
+                self._session = session
+                if ready_future is not None and not ready_future.done():
+                    ready_future.set_result(None)
+                while True:
+                    request = await request_queue.get()
+                    if request.operation == "close":
+                        if not request.response.done():
+                            request.response.set_result(None)
+                        break
+                    try:
+                        result = await self._execute_request(session, request)
+                    except BaseException as error:
+                        if not request.response.done():
+                            request.response.set_exception(error)
+                    else:
+                        if not request.response.done():
+                            request.response.set_result(result)
+        except BaseException as error:
+            if ready_future is not None and not ready_future.done():
+                ready_future.set_exception(error)
+            self._fail_pending_requests(error)
+            raise
+        finally:
+            self._session = None
+            self._request_queue = None
+            self._ready_future = None
+            self._worker_task = None
+            if self._stderr_handle is not None:
+                self._stderr_handle.close()
+                self._stderr_handle = None
+
+    async def _execute_request(self, session: ClientSession, request: ChildWorkerRequest) -> Any:
+        if request.operation == "list_tools":
+            return (await session.list_tools()).tools
+        if request.operation == "call_tool":
+            return await session.call_tool(
+                request.name or "",
+                request.arguments or {},
+                meta=request.meta,
+            )
+        raise RuntimeError(f"未知子进程操作：{request.operation}")
+
+    def _fail_pending_requests(self, error: BaseException) -> None:
+        request_queue = self._request_queue
+        if request_queue is None:
+            return
+        while True:
+            try:
+                request = request_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if not request.response.done():
+                request.response.set_exception(error)
 
 
 class WorkspaceSerenaRegistry:

@@ -6,7 +6,7 @@ import yaml
 from mcp.types import TextContent
 
 from serena_workspace_router.config import sanitize_segment, sha1_text
-from serena_workspace_router.server import ResolvedRequestContext, RouterConfig, WorkspaceSerenaRouterServer
+from serena_workspace_router.server import ResolvedRequestContext, RouterConfig, WorkspaceSerenaRouterServer, _normalize_request_meta
 
 
 def _write_project_config(project_root: Path, languages: list[str]) -> None:
@@ -269,3 +269,22 @@ def test_router_launcher_tools_cover_codex_binding_inspect_and_setup(tmp_path: P
         assert setup_payload["project_binding_ok"] is True
     finally:
         anyio.run(router.close)
+
+
+class _DummyMeta:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._payload = payload
+
+    def model_dump(self, *, by_alias: bool, exclude_none: bool) -> dict[str, object]:
+        assert by_alias is True
+        assert exclude_none is True
+        return dict(self._payload)
+
+
+def test_normalize_request_meta_supports_dict_and_model_dump() -> None:
+    raw_meta = {"workspaceId": "ws-a", "clientId": "codex"}
+    dumped_meta = _DummyMeta({"workspaceId": "ws-b", "clientId": "agent-b"})
+
+    assert _normalize_request_meta(raw_meta) == raw_meta
+    assert _normalize_request_meta(dumped_meta) == {"workspaceId": "ws-b", "clientId": "agent-b"}
+    assert _normalize_request_meta(None) == {}

@@ -4,6 +4,7 @@ import json
 import os
 import shutil
 import sys
+from collections.abc import Mapping
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from pathlib import Path
@@ -469,7 +470,7 @@ class WorkspaceSerenaRouterServer:
 
     async def _handle_tool_call(self, tool_name: str, arguments: dict[str, Any]) -> types.CallToolResult:
         request_context = self.server.request_context
-        meta = request_context.meta.model_dump(by_alias=True, exclude_none=True) if request_context.meta is not None else {}
+        meta = _normalize_request_meta(request_context.meta)
         meta_values = dict(meta.get("_meta", meta))
         session_id = self._get_session_id()
 
@@ -721,3 +722,20 @@ def _list_of_strings(value: object) -> list[str]:
 def _tool_result_to_text(result: types.CallToolResult) -> str:
     texts = [block.text for block in result.content if isinstance(block, TextContent)]
     return "\n".join(texts)
+
+
+def _normalize_request_meta(meta: object) -> dict[str, Any]:
+    if meta is None:
+        return {}
+    if isinstance(meta, dict):
+        return dict(meta)
+    if isinstance(meta, Mapping):
+        return {str(key): value for key, value in meta.items()}
+    model_dump = getattr(meta, "model_dump", None)
+    if callable(model_dump):
+        dumped = model_dump(by_alias=True, exclude_none=True)
+        if isinstance(dumped, dict):
+            return dumped
+        if isinstance(dumped, Mapping):
+            return {str(key): value for key, value in dumped.items()}
+    return {}

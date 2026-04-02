@@ -62,6 +62,7 @@ explicit = true
 [project.scripts]
 serena = "serena.cli:top_level"
 serena-mcp-server = "serena.cli:start_mcp_server"
+serena-workspace-router = "serena_workspace_router.cli:top_level"
 index-project = "serena.cli:index_project"        # deprecated
 
 [project.license]
@@ -103,7 +104,7 @@ google = ["google-genai==1.27.0"]
 Homepage = "https://github.com/oraios/serena"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/serena", "src/interprompt", "src/solidlsp"]
+packages = ["src/serena", "src/serena_workspace_router", "src/interprompt", "src/solidlsp"]
 
 [tool.doc8]
 max-line-length = 1000
@@ -153,7 +154,7 @@ _ruff_fix = "ruff check --fix src scripts test"
 _ruff_format = "ruff format src scripts test"
 lint = ["_ruff_format_check", "_ruff_check"]
 format = ["_ruff_fix", "_ruff_format"]
-_mypy_core = "mypy src/serena src/solidlsp"
+_mypy_core = "mypy src/serena src/serena_workspace_router src/solidlsp"
 _mypy_test = "mypy --disable-error-code no-untyped-def test"
 type-check = ["_mypy_core", "_mypy_test"]
 # docs
